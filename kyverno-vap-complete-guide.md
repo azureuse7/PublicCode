@@ -484,7 +484,6 @@ kind: Deployment
 metadata:
   name: gap-test
   namespace: vap-poc
-  labels: { env: testing }
 spec:
   replicas: 1
   selector: { matchLabels: { app: gap-test } }
@@ -495,27 +494,92 @@ spec:
       containers:
         - name: nginx
           image: nginx
+          ports:
+            - containerPort: 80
+              hostPort: 8080          # ← THE VIOLATION - disallow-host-ports
 EOF
 
-# 1. Confirm an existing Deny-mode policy blocks it
+# 1. Create the baseline Deny-mode policy this demo relies on.
+#    This is a PoC-scoped copy of our real disallow-host-ports, in its CURRENT
+#    (unconverted) shape: pod-scoped + podControllers autogen = webhook-only.
+cat > tests/poc-baseline-deny.yaml << 'EOF'
+apiVersion: policies.kyverno.io/v1        # ← VERIFY the served version - Step 0 table
+kind: ValidatingPolicy
+metadata:
+  name: poc-disallow-host-ports
+spec:
+  validationActions: [Deny]
+  autogen:
+    podControllers:
+      controllers: [deployments]          # webhook-only ON PURPOSE - this is the "before" state
+  matchConstraints:
+    resourceRules:
+      - apiGroups:   [""]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [pods]
+    namespaceSelector:                    # scoped to the PoC namespace - do NOT let this hit prod
+      matchLabels:
+        kubernetes.io/metadata.name: vap-poc
+  validations:
+    - expression: >-
+        object.spec.containers.all(c,
+          !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: "Use of host ports is disallowed"
+EOF
+
+kubectl apply -f tests/poc-baseline-deny.yaml && sleep 10
+
+# 2. Confirm it blocks the violating deployment
 kubectl apply -f tests/violating-deployment.yaml
 # EXPECT: denied by validate.kyverno.svc
 
-# 2. Take Kyverno down
+# 3. Take Kyverno down
 kubectl scale deploy kyverno-admission-controller -n kyverno --replicas=0
 kubectl wait --for=delete pod -l app.kubernetes.io/component=admission-controller \
   -n kyverno --timeout=120s
 
-# 3. Are the webhooks gone?
+# 4. Are the webhooks gone?
 kubectl get validatingwebhookconfigurations -l webhook.kyverno.io/managed-by=kyverno
 
-# 4. Try again
+# 5. Try again
 kubectl apply -f tests/violating-deployment.yaml 2>&1 | tee results/step1-the-gap.txt
 # EXPECT: created — THIS IS THE GAP
 
-# 5. Clean up and restore
+# 6. Clean up and restore
 kubectl delete deploy gap-test -n vap-poc
 kubectl scale deploy kyverno-admission-controller -n kyverno --replicas=<baseline>
+
+# 7. DELETE the baseline policy - it MUST NOT survive into Step 5 (see note below)
+kubectl delete -f tests/poc-baseline-deny.yaml
+```
+
+**Why a scoped copy instead of our real `disallow-host-ports`.** The demo needs a Deny-mode policy
+that this exact manifest violates, and it needs the *same rule* in Step 5 so the only variable
+between "before" and "after" is the conversion. `poc-disallow-host-ports` is our real
+`disallow-host-ports` rule, unchanged, with two deliberate differences:
+
+| Difference | Why |
+|---|---|
+| `namespaceSelector` pinned to `vap-poc` | The real policy is cluster-wide. Nothing in this PoC should be able to deny a production workload |
+| Kept on `podControllers` autogen | This is the *current* state of our policy set — pod-scoped rule, controllers covered by autogen, therefore **no VAP**. That is precisely why it vanishes when Kyverno scales to zero |
+
+**Do not run Step 1 against the real `disallow-host-ports`.** If it is already in `[Deny]`, taking
+Kyverno down to prove the gap also drops enforcement for every other namespace on the cluster for the
+length of the demo. The scoped copy costs nothing and contains the blast radius.
+
+> **Delete it at the end of this step.** If it is still on the cluster during Step 5, the
+> `blocks while Kyverno is UP` check would be denied by the webhook copy rather than by the VAP, and
+> the deny message will not tell you which one acted. Confirm with
+> `kubectl get vpol poc-disallow-host-ports` — it should return `NotFound` before you start Step 4.
+
+Check what mode the real policy is in before you start, so you know what the "before" state actually
+is on this cluster:
+
+```bash
+kubectl get vpol disallow-host-ports disallow-host-process \
+  -o custom-columns=NAME:.metadata.name,ACTIONS:.spec.validationActions,GENERATED:.status.generated
+# ACTIONS unset means Deny (Section 5.2). GENERATED should be false/empty today - that is the gap.
 ```
 
 ---
@@ -685,10 +749,14 @@ name, which would produce an invalid VAP.
 
 | Policy | Source | Action | Blockers | Rewrite needed | Exceptions attached |
 |---|---|---|---|---|---|
-| disallow-host-path | upstream | Convert | none | — | 2 |
-| require-team-label | custom | Convert | podControllers | Enumerate resources in `matchConstraints` | 0 |
-| verify-image-signature | custom | Keep on webhook | image CEL library | — | 1 |
+| disallow-host-ports | upstream copy | Convert | podControllers | Enumerate workload kinds in `matchConstraints`; hand-write pod-spec resolution | |
+| disallow-host-process | upstream copy | Convert | podControllers | Same, plus pod-level **and** container-level `securityContext` | |
+| verify-image-signature | custom | Keep on webhook | image CEL library | — | |
 | … | | | | | |
+
+> Every policy copied from upstream Kyverno's pod-security set will show `podControllers` as a
+> blocker — that is how upstream writes them. It is not a real blocker, but it is not free either:
+> see Step 4 for what replacing that autogen actually costs.
 
 **Headline number:** `X of Y policies convertible (Z%)`.
 
@@ -699,11 +767,51 @@ name, which would produce an invalid VAP.
 **What it proves:** the mechanism works end to end.
 **Why it matters:** start small. One low-risk policy, in **Audit** mode.
 
+We use **`disallow-host-ports`**. It is a good first candidate: the rule is a pure structural check
+on the object with no external lookups, so nothing in it hits the Kyverno-only CEL libraries listed
+in Step 3. `disallow-host-process` follows the same shape and is converted at the end of this step.
+
+#### Before — what we have today
+
+Copied from upstream, so it is **pod-scoped** and leans on `podControllers` autogen to cover the
+workload kinds:
+
 ```yaml
 apiVersion: policies.kyverno.io/v1        # ← VERIFY the served version - Step 0 table
 kind: ValidatingPolicy
 metadata:
-  name: check-deployment-labels
+  name: disallow-host-ports
+spec:
+  validationActions: [Audit]
+  autogen:
+    podControllers:
+      controllers: [deployments, statefulsets, daemonsets, jobs, cronjobs, replicasets]
+  matchConstraints:
+    resourceRules:
+      - apiGroups:   [""]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [pods]
+  validations:
+    - expression: >-
+        object.spec.containers.all(c,
+          !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+      message: "Use of host ports is disallowed"
+```
+
+**That `podControllers` block is doing real work.** It silently rewrites the rule for six other
+kinds, rebasing every `object.spec.*` path onto `spec.template.spec.*` (and onto
+`spec.jobTemplate.spec.template.spec.*` for CronJobs). Section 5.1 says it is mutually exclusive with
+VAP generation — so converting this policy means **writing that rewrite by hand**. This is the real
+cost of conversion, and it is invisible until you try.
+
+#### After — the converted policy
+
+```yaml
+apiVersion: policies.kyverno.io/v1        # ← VERIFY the served version - Step 0 table
+kind: ValidatingPolicy
+metadata:
+  name: disallow-host-ports
 spec:
   validationActions: [Audit]              # ALWAYS set this - unset means Deny
   autogen:
@@ -713,26 +821,80 @@ spec:
       controllers: []                     # MUST be empty, or generation is skipped
   matchConstraints:
     resourceRules:
+      - apiGroups:   [""]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [pods]
       - apiGroups:   [apps]
         apiVersions: [v1]
         operations:  [CREATE, UPDATE]
-        resources:   [deployments]
+        resources:   [deployments, statefulsets, daemonsets, replicasets]
+      - apiGroups:   [batch]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [jobs, cronjobs]
   variables:
-    - name: environment
+    # This replaces podControllers autogen: resolve the pod spec for whichever kind matched.
+    # CronJob MUST be tested first - its spec has jobTemplate, not template.
+    - name: podSpec
       expression: >-
-        has(object.metadata.labels) && 'env' in object.metadata.labels
-        && object.metadata.labels['env'] == 'prod'
+        has(object.spec.jobTemplate)
+          ? object.spec.jobTemplate.spec.template.spec
+          : (has(object.spec.template) ? object.spec.template.spec : object.spec)
+    - name: portsOK
+      expression: >-
+        variables.podSpec.containers.all(c,
+          !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+    - name: initPortsOK
+      expression: >-
+        !has(variables.podSpec.initContainers) ||
+        variables.podSpec.initContainers.all(c,
+          !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
+    - name: ephemeralPortsOK
+      expression: >-
+        !has(variables.podSpec.ephemeralContainers) ||
+        variables.podSpec.ephemeralContainers.all(c,
+          !has(c.ports) || c.ports.all(p, !has(p.hostPort) || p.hostPort == 0))
   validations:
-    - expression: "variables.environment == true"
-      message: "Deployment labels must be env=prod"
+    - expression: "variables.portsOK && variables.initPortsOK && variables.ephemeralPortsOK"
+      message: >-
+        Use of host ports is disallowed. hostPort must be unset or 0 on all containers,
+        initContainers and ephemeralContainers.
 ```
+
+| What changed | Why |
+|---|---|
+| `podControllers.controllers: []` | Required, or generation is skipped silently (Section 5.1) |
+| `matchConstraints` enumerates 7 kinds | Hand-written replacement for what autogen covered |
+| New `podSpec` variable | Resolves the three different pod-spec paths |
+| Three separate `.all()` variables | **Not** one concatenated container list — see below |
+
+**Three gotchas in that CEL, all of which will bite you:**
+
+1. **Do not concatenate the container lists.** `containers + initContainers + ephemeralContainers`
+   reads better, but `EphemeralContainer` is a different type from `Container` and the API server's
+   CEL type-checker can reject the mixed list at VAP-creation time. Keep the clauses separate.
+2. **CronJob must be tested before the `template` branch.** A CronJob has `spec.jobTemplate`, not
+   `spec.template`. Get the order wrong and CronJobs silently fall through to the `object.spec`
+   branch, where `containers` does not exist — the expression errors and, depending on
+   `failurePolicy`, may fail *open*.
+3. **`ephemeralContainers` will almost never fire here.** They cannot be set on create; `kubectl
+   debug` adds them through the `pods/ephemeralcontainers` subresource. To actually catch that path
+   you need a fourth resource rule with `resources: [pods/ephemeralcontainers]`. Decide whether the
+   PoC covers it and write the answer down either way.
+
+> **`operations: [UPDATE]` on `replicasets` and `pods` has a blast radius.** Once this flips to
+> `Deny` in Step 5, any *existing* workload that already uses a host port can no longer be updated —
+> which can wedge an in-flight rollout, not just block new deploys. This is the single strongest
+> argument for the Audit-first ordering in this guide. Use the dry-run sweep in Step 5 to find those
+> workloads **before** flipping.
 
 **Helm override shape.** Keep the opt-in in our own values file rather than editing vendored
 upstream YAML, so upstream sync tooling stays non-destructive:
 
 ```yaml
 policies:
-  check-deployment-labels:
+  disallow-host-ports:
     enabled: true
     validationActions: [Audit]
     autogen:
@@ -751,7 +913,7 @@ Add a chart-level guard so the two can never be set together:
 #### Verify
 
 ```bash
-POL=check-deployment-labels
+POL=disallow-host-ports
 
 # The only signal that matters
 kubectl get vpol $POL -o jsonpath='{.status.generated}'
@@ -786,9 +948,17 @@ kubectl get validatingwebhookconfigurations -l webhook.kyverno.io/managed-by=kyv
   | jq '.items[].webhooks[] | {name, rules: .rules}'
 ```
 
-Compare with `baseline/webhooks.yaml`. **Expect `apps/v1 deployments` to have been removed** from
-the Kyverno webhook rules. Then apply a violating resource while Kyverno is **up**: you should see
-exactly **one** denial message, and it should come from the API server, not `validate.kyverno.svc`.
+Compare with `baseline/webhooks.yaml`. **Expect the rules this policy contributed — `v1 pods`,
+`apps/v1 deployments|statefulsets|daemonsets|replicasets`, `batch/v1 jobs|cronjobs` — to have been
+removed** from the Kyverno webhook rules. Then apply a violating resource while Kyverno is **up**:
+you should see exactly **one** denial message, and it should come from the API server, not
+`validate.kyverno.svc`.
+
+> Those rules only disappear if **no other** unconverted policy still needs them. `pods` and
+> `deployments` are matched by most of the pod-security set, so with only `disallow-host-ports`
+> converted you will probably see them still listed — contributed by `disallow-host-process` and the
+> rest. That is expected, not a failure. The per-policy signal is `status.generated`, not the webhook
+> diff; the webhook only empties out once *every* policy claiming a resource has converted.
 
 #### Negative test — prove the podControllers trap is real
 
@@ -807,6 +977,91 @@ kubectl patch vpol $POL --type=merge \
 
 This demonstrates the silent-revert risk to the team better than any slide.
 
+#### Second policy — `disallow-host-process`
+
+Only once `disallow-host-ports` shows `status.generated: true`. Same conversion, one extra wrinkle:
+this rule checks `securityContext.windowsOptions.hostProcess` at **both** pod level and container
+level, so the hand-written version needs both.
+
+```yaml
+apiVersion: policies.kyverno.io/v1        # ← VERIFY the served version - Step 0 table
+kind: ValidatingPolicy
+metadata:
+  name: disallow-host-process
+spec:
+  validationActions: [Audit]
+  autogen:
+    validatingAdmissionPolicy:
+      enabled: true
+    podControllers:
+      controllers: []
+  matchConstraints:
+    resourceRules:                        # identical to disallow-host-ports - keep them in sync
+      - apiGroups:   [""]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [pods]
+      - apiGroups:   [apps]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [deployments, statefulsets, daemonsets, replicasets]
+      - apiGroups:   [batch]
+        apiVersions: [v1]
+        operations:  [CREATE, UPDATE]
+        resources:   [jobs, cronjobs]
+  variables:
+    - name: podSpec
+      expression: >-
+        has(object.spec.jobTemplate)
+          ? object.spec.jobTemplate.spec.template.spec
+          : (has(object.spec.template) ? object.spec.template.spec : object.spec)
+    - name: podLevelOK                    # spec.securityContext.windowsOptions.hostProcess
+      expression: >-
+        !has(variables.podSpec.securityContext) ||
+        !has(variables.podSpec.securityContext.windowsOptions) ||
+        !has(variables.podSpec.securityContext.windowsOptions.hostProcess) ||
+        variables.podSpec.securityContext.windowsOptions.hostProcess == false
+    - name: containersOK
+      expression: >-
+        variables.podSpec.containers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.windowsOptions) ||
+          !has(c.securityContext.windowsOptions.hostProcess) ||
+          c.securityContext.windowsOptions.hostProcess == false)
+    - name: initContainersOK
+      expression: >-
+        !has(variables.podSpec.initContainers) ||
+        variables.podSpec.initContainers.all(c,
+          !has(c.securityContext) ||
+          !has(c.securityContext.windowsOptions) ||
+          !has(c.securityContext.windowsOptions.hostProcess) ||
+          c.securityContext.windowsOptions.hostProcess == false)
+  validations:
+    - expression: >-
+        variables.podLevelOK && variables.containersOK && variables.initContainersOK
+      message: >-
+        HostProcess containers are disallowed. hostProcess must be undefined or false at both
+        pod and container level.
+```
+
+**Note the duplicated `podSpec` variable and the duplicated `matchConstraints`.** Every policy we
+convert carries its own copy, and they must stay identical or the two policies will disagree about
+which kinds they cover. Two copies is fine; twenty is a maintenance problem. Record this in the
+write-up — it is a genuine argument for templating `matchConstraints` and `podSpec` in the chart, and
+a genuine argument against converting the whole policy set at once.
+
+```bash
+kubectl get vpol disallow-host-ports disallow-host-process \
+  -o custom-columns=NAME:.metadata.name,GENERATED:.status.generated
+# EXPECT: both true
+```
+
+> **This policy is Windows-only.** On an all-Linux node pool nothing will ever violate it, so a
+> "passing" resilience test in Step 5 proves nothing about it. Either run Step 5 against
+> `disallow-host-ports` (as written) or add a Windows-shaped test manifest — a pod with
+> `securityContext.windowsOptions.hostProcess: true` will be evaluated by the API server regardless
+> of whether it could ever be scheduled.
+
 ---
 
 ### Step 5 — The resilience test (the headline result)
@@ -815,7 +1070,7 @@ This demonstrates the silent-revert risk to the team better than any slide.
 **Why it matters:** this is the whole point of the exercise.
 
 ```bash
-POL=check-deployment-labels
+POL=disallow-host-ports
 
 # 0. Flip to Deny and confirm the binding follows
 kubectl patch vpol $POL --type=merge -p '{"spec":{"validationActions":["Deny"]}}'
@@ -845,11 +1100,16 @@ kubectl apply -f tests/violating-deployment.yaml 2>&1 | tee results/step5-the-pr
 **Expected output:**
 
 ```
-The deployments "gap-test" is invalid: : ValidatingAdmissionPolicy 'vpol-check-deployment-labels'
-with binding 'vpol-check-deployment-labels-binding' denied request: Deployment labels must be env=prod
+The deployments "gap-test" is invalid: : ValidatingAdmissionPolicy 'vpol-disallow-host-ports'
+with binding 'vpol-disallow-host-ports-binding' denied request: Use of host ports is disallowed.
+hostPort must be unset or 0 on all containers, initContainers and ephemeralContainers.
 ```
 
 The denial comes from the **API server**. That is the proof.
+
+> **Before you run step 0, re-read the blast-radius warning in Step 4.** `disallow-host-ports` is
+> cluster-wide, so flipping it to `Deny` enforces it on every namespace, including on `UPDATE` to
+> workloads that already use host ports. Run the dry-run sweep below **first**, not after.
 
 ```bash
 # 5. Control test - an UNCONVERTED policy, same outage window
@@ -925,7 +1185,7 @@ metadata:
   namespace: <our-exception-namespace>
 spec:
   policyRefs:
-    - name: check-deployment-labels
+    - name: disallow-host-ports
       kind: ValidatingPolicy
   matchConditions:
     - name: skip-important-tool          # THIS NAME MUST BE UNIQUE per policy
@@ -939,7 +1199,7 @@ kubectl apply -f tests/exception.yaml
 sleep 15
 
 # THE MECHANISM CHECK. If this is empty, nothing else in Step 6 will work.
-kubectl get validatingadmissionpolicy vpol-check-deployment-labels \
+kubectl get validatingadmissionpolicy vpol-disallow-host-ports \
   -o jsonpath='{.spec.matchConditions}' | jq | tee results/step6a-vap-matchconditions.json
 # EXPECT: [{"name":"skip-important-tool","expression":"!(object.metadata.name == 'important-tool')"}]
 ```
@@ -950,7 +1210,13 @@ on its own — Kyverno is no longer involved at request time. Save it for the wr
 
 **Part 2 — behaviour with Kyverno UP (the control)**
 
+The exempt manifest is `tests/violating-deployment.yaml` with one change — the name the exception
+matches on. Same host-port violation, so the *only* reason it can be admitted is the exemption:
+
 ```bash
+sed 's/name: gap-test/name: important-tool/; s/app: gap-test/app: important-tool/' \
+  tests/violating-deployment.yaml > tests/important-tool-deployment.yaml
+
 kubectl apply -f tests/important-tool-deployment.yaml   # violating, but named important-tool
 # EXPECT: allowed
 kubectl delete deploy important-tool -n vap-poc
@@ -970,7 +1236,7 @@ kubectl wait --for=delete pod -l app.kubernetes.io/part-of=kyverno -n kyverno --
 kubectl get pods -n kyverno            # EXPECT: no resources found
 
 # Confirm the VAP is still there even though Kyverno is not
-kubectl get validatingadmissionpolicy vpol-check-deployment-labels \
+kubectl get validatingadmissionpolicy vpol-disallow-host-ports \
   -o jsonpath='{.spec.matchConditions}' | jq
 # EXPECT: the negated condition is STILL present
 
@@ -1034,7 +1300,7 @@ apiVersion: policies.kyverno.io/v1alpha1   # ← VERIFY on your cluster - see Se
 kind: PolicyException
 metadata: { name: skip-by-name, namespace: <ns> }
 spec:
-  policyRefs: [{ name: check-deployment-labels, kind: ValidatingPolicy }]
+  policyRefs: [{ name: disallow-host-ports, kind: ValidatingPolicy }]
   matchConditions:
     - name: skip-by-name
       expression: "object.metadata.name == 'important-tool'"
@@ -1043,14 +1309,14 @@ apiVersion: policies.kyverno.io/v1alpha1   # ← VERIFY on your cluster - see Se
 kind: PolicyException
 metadata: { name: skip-by-namespace, namespace: <ns> }
 spec:
-  policyRefs: [{ name: check-deployment-labels, kind: ValidatingPolicy }]
+  policyRefs: [{ name: disallow-host-ports, kind: ValidatingPolicy }]
   matchConditions:
     - name: skip-by-namespace
       expression: "namespaceObject.metadata.name == 'testing-ns'"
 ```
 
 ```bash
-kubectl get validatingadmissionpolicy vpol-check-deployment-labels \
+kubectl get validatingadmissionpolicy vpol-disallow-host-ports \
   -o jsonpath='{.spec.matchConditions}' | jq
 # EXPECT: both present, both negated, ANDed together
 ```
@@ -1067,8 +1333,8 @@ kubectl get validatingadmissionpolicy vpol-check-deployment-labels \
 ```
 
 ```bash
-kubectl get vpol check-deployment-labels -o jsonpath='{.status}' | jq
-kubectl get validatingadmissionpolicy vpol-check-deployment-labels -o yaml
+kubectl get vpol disallow-host-ports -o jsonpath='{.status}' | jq
+kubectl get validatingadmissionpolicy vpol-disallow-host-ports -o yaml
 kubectl logs -n kyverno -l app.kubernetes.io/component=admission-controller --tail=100 \
   | grep -i "matchcondition\|duplicate\|invalid"
 ```
@@ -1189,7 +1455,7 @@ kubectl delete -f tests/exception.yaml --ignore-not-found; sleep 20
 
 T0=$(date +%s)
 kubectl apply -f tests/exception.yaml
-until kubectl get validatingadmissionpolicy vpol-check-deployment-labels \
+until kubectl get validatingadmissionpolicy vpol-disallow-host-ports \
       -o jsonpath='{.spec.matchConditions}' 2>/dev/null | grep -q important-tool; do
   sleep 1
 done
@@ -1274,12 +1540,28 @@ AKSAuditAdmin
 
 ```bash
 kyverno version
-kyverno apply ./policies/check-deployment-labels.yaml --resource ./test/violating-deployment.yaml
-kyverno test ./test/
+kyverno apply ./policies/disallow-host-ports.yaml --resource ./tests/violating-deployment.yaml
+kyverno test ./tests/
 
 # Generated VAPs must be valid Kubernetes objects
 kubectl apply --dry-run=server -f ./generated-vaps/
 ```
+
+**Add a per-kind fixture set.** The hand-written `podSpec` variable from Step 4 is the part most
+likely to be wrong, and `kyverno apply` against a Deployment exercises exactly one of its three
+branches. CI needs a violating *and* a compliant fixture for each kind in `matchConstraints`:
+
+```bash
+for kind in pod deployment statefulset daemonset replicaset job cronjob; do
+  kyverno apply ./policies/disallow-host-ports.yaml \
+    --resource ./tests/fixtures/$kind-violating.yaml   # EXPECT: fail
+  kyverno apply ./policies/disallow-host-ports.yaml \
+    --resource ./tests/fixtures/$kind-compliant.yaml   # EXPECT: pass
+done
+```
+
+The CronJob fixture is the one that matters most — it is the only kind that exercises the
+`jobTemplate` branch, and gotcha 2 in Step 4 fails *open* rather than loudly.
 
 Add two chart-level guards:
 1. `podControllers` and `validatingAdmissionPolicy` must never both be set.
