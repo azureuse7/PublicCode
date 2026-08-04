@@ -1,0 +1,67 @@
+# Kyverno CEL Policies & Native Resiliency
+
+Kyverno's five CEL-based policy types (`ValidatingPolicy`, `MutatingPolicy`, `GeneratingPolicy`, `DeletingPolicy`, `ImageValidatingPolicy`) reached **Stable** status on API version `policies.kyverno.io/v1` in Kyverno **v1.18**, and are the intended replacement for the legacy `ClusterPolicy`/`CleanupPolicy` types, which are now deprecated and scheduled for removal in v1.20 (~Oct 2026). See the [Policy Types overview](https://kyverno.io/docs/policy-types/overview/).
+
+Two of the five can compile down into a native Kubernetes admission object that the API server enforces directly, independent of Kyverno. The other three can't — the actions they perform (generating resources, deleting on a schedule, calling out to an OCI registry) have no equivalent among Kubernetes' native admission controllers ([full list here](https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/)).
+
+## 1. ValidatingPolicy → generates a ValidatingAdmissionPolicy: **Yes**
+
+`ValidatingPolicy` extends the native Kubernetes `ValidatingAdmissionPolicy` (VAP) type, adding the extra fields Kyverno needs for policy-as-code features — reporting, exceptions, JSON payload support — on top of the underlying CEL validation logic. Setting `spec.autogen.validatingAdmissionPolicy.enabled: true` makes Kyverno compile the policy into a real `ValidatingAdmissionPolicy` + `ValidatingAdmissionPolicyBinding` pair, which the API server then evaluates in-process, with no round trip to the Kyverno webhook needed.
+
+- Kyverno docs: https://kyverno.io/docs/policy-types/validating-policy/
+- Kubernetes reference: https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+- `ValidatingAdmissionPolicy` has been GA since Kubernetes **v1.30**.
+
+## 2. MutatingPolicy → generates a MutatingAdmissionPolicy: **Yes**
+
+Same pattern, one layer up. `MutatingPolicy` extends the native Kubernetes `MutatingAdmissionPolicy` (MAP) type and can likewise autogen a real `MutatingAdmissionPolicy` + binding, so patches (via CEL / `ApplyConfiguration`) apply natively in the API server rather than through Kyverno's mutating webhook.
+
+- Kyverno docs: https://kyverno.io/docs/policy-types/mutating-policy/
+- Kubernetes reference: https://kubernetes.io/docs/reference/kubernetes-api/admissionregistration/mutating-admission-policy-v1/
+- `MutatingAdmissionPolicy` only reached GA in Kubernetes **v1.36** (22 Apr 2026) — worth flagging since it's a lot newer and less battle-tested than VAP. See the [Kubernetes v1.36 release announcement](https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/).
+
+## 3. GeneratingPolicy → native K8s equivalent: **None**
+
+Admission control can only accept, deny, or mutate the object it was invoked for — there's no native mechanism for an admission policy to create a *different*, new resource. `GeneratingPolicy` is a purely Kyverno-side construct: it runs through Kyverno's background/generate controller, which watches for trigger events (e.g. a new Namespace) and clones or templates resources in response. If that controller isn't running, nothing gets generated.
+
+- Kyverno docs: https://kyverno.io/docs/policy-types/generating-policy/
+
+## 4. DeletingPolicy → native K8s equivalent: **None**
+
+Native admission policies only fire on admission requests (CREATE/UPDATE/etc.) — they have no concept of a cron schedule. `DeletingPolicy` runs on a cron schedule via Kyverno's cleanup controller, which needs its own RBAC (`get`/`list`/`watch`/`delete`) on the targeted resource types. No cleanup controller, no scheduled deletion.
+
+- Kyverno docs: https://kyverno.io/docs/policy-types/deleting-policy/
+
+## 5. ImageValidatingPolicy → native K8s equivalent: **None**
+
+Signature and attestation verification — Cosign public keys, keyless/Rekor transparency-log lookups, SBOM attestations — means reaching out over the network to an OCI registry and/or a transparency log. CEL evaluation inside a native `ValidatingAdmissionPolicy` is sandboxed and can't make external calls, so even though `ImageValidatingPolicy` is itself built as an extension of Kyverno's `ValidatingPolicy`, it still depends on the Kyverno webhook to actually perform the verification.
+
+- Kyverno docs: https://kyverno.io/docs/policy-types/image-validating-policy/
+
+## Summary: surviving a Kyverno webhook/pod outage
+
+| Kyverno Policy Type | Native K8s Translation | Survives Kyverno Webhook Outage? |
+|---|---|---|
+| ValidatingPolicy | ValidatingAdmissionPolicy | **Yes** — runs natively in the API server |
+| MutatingPolicy | MutatingAdmissionPolicy | **Yes** — runs natively in the API server |
+| GeneratingPolicy | None | **No** — requires the Kyverno generate controller |
+| DeletingPolicy | None | **No** — requires the Kyverno cleanup controller |
+| ImageValidatingPolicy | None | **No** — requires the Kyverno webhook (external registry/OCI calls) |
+
+## Note: PolicyExceptions and autogenerated VAP/MAP
+
+Worth checking explicitly in any resilience testing: since **Kyverno 1.13**, a `PolicyException` scoped to a policy gets folded into the generated `ValidatingAdmissionPolicy` as `matchConstraints.excludeResourceRules`, rather than blocking VAP generation outright (which was the pre-1.13 behaviour). See the [Kyverno 1.13 release notes](https://kyverno.io/blog/2024/10/30/announcing-kyverno-release-1.13/) and the [Policy Exceptions guide](https://kyverno.io/docs/guides/exceptions/), which has a section specifically on using `PolicyException` with `ValidatingPolicy` in admission mode.
+
+## References
+
+- Kyverno Policy Types overview — https://kyverno.io/docs/policy-types/overview/
+- Kyverno ValidatingPolicy — https://kyverno.io/docs/policy-types/validating-policy/
+- Kyverno MutatingPolicy — https://kyverno.io/docs/policy-types/mutating-policy/
+- Kyverno GeneratingPolicy — https://kyverno.io/docs/policy-types/generating-policy/
+- Kyverno DeletingPolicy — https://kyverno.io/docs/policy-types/deleting-policy/
+- Kyverno ImageValidatingPolicy — https://kyverno.io/docs/policy-types/image-validating-policy/
+- Kyverno Policy Exceptions guide — https://kyverno.io/docs/guides/exceptions/
+- Kubernetes ValidatingAdmissionPolicy reference — https://kubernetes.io/docs/reference/access-authn-authz/validating-admission-policy/
+- Kubernetes MutatingAdmissionPolicy reference — https://kubernetes.io/docs/reference/kubernetes-api/admissionregistration/mutating-admission-policy-v1/
+- Kubernetes v1.36 release blog (MutatingAdmissionPolicy → GA) — https://kubernetes.io/blog/2026/04/22/kubernetes-v1-36-release/
+- Kubernetes admission controllers reference — https://kubernetes.io/docs/reference/access-authn-authz/admission-controllers/
