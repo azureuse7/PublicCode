@@ -1,0 +1,87 @@
+# =============================================================================
+# Protects the Kyverno admission webhook configurations.
+#
+# Deleting or editing these turns every Kyverno policy into a silent no-op.
+# This runs in-process in kube-apiserver, so it still works when Kyverno is
+# down, broken, or uninstalled - which a Kyverno policy protecting the same
+# resources could not, because it is enforced through the very webhook being
+# removed.
+#
+# Requires Kubernetes 1.30+ for admissionregistration.k8s.io/v1.
+# On 1.28-1.29 change both apiVersions to v1beta1.
+# =============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: protect-kyverno-webhooks
+spec:
+  # Fail closed: a CEL compile or runtime error denies the request.
+  failurePolicy: Fail
+
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   ["admissionregistration.k8s.io"]
+      apiVersions: ["*"]
+      operations:  ["CREATE", "UPDATE", "DELETE"]
+      resources:
+      - validatingwebhookconfigurations
+      - mutatingwebhookconfigurations
+
+  # matchConditions are ANDed, and are evaluated BEFORE the rest of the policy.
+  # Note: `variables` are deliberately not available here (Kubernetes evaluates
+  # matchConditions first), so these expressions have to stand alone.
+  matchConditions:
+
+  # Only Kyverno's own webhook configurations. Adjust the prefix if you have set
+  # fullnameOverride / a non-default Helm release name.
+  - name: only-kyverno-webhooks
+    expression: "request.name.startsWith('kyverno-')"
+
+  # Kyverno MANAGES ITS OWN WEBHOOK CONFIGURATIONS at runtime - it rewrites them
+  # as policies are added and removed. Without this exemption Kyverno breaks
+  # itself on startup. Verify these names against your install:
+  #   kubectl -n kyverno get sa
+  - name: exclude-kyverno-controllers
+    expression: >-
+      !(request.userInfo.username in [
+        'system:serviceaccount:kyverno:kyverno-admission-controller',
+        'system:serviceaccount:kyverno:kyverno-background-controller',
+        'system:serviceaccount:kyverno:kyverno-cleanup-controller',
+        'system:serviceaccount:kyverno:kyverno-reports-controller'
+      ])
+
+  # Your GitOps controller needs this to upgrade the Kyverno chart. Without it,
+  # the next Argo sync or Helm upgrade fails. Replace with your actual SA, or
+  # delete this condition if Kyverno is not managed by GitOps.
+  - name: exclude-gitops-controller
+    expression: >-
+      !(request.userInfo.username in [
+        'system:serviceaccount:argocd:argocd-application-controller'
+      ])
+
+  validations:
+  - expression: "false"          # anything reaching here is denied
+    reason: Forbidden
+    message: >-
+      This Kyverno webhook configuration is protected by the
+      protect-kyverno-webhooks ValidatingAdmissionPolicy.
+    messageExpression: >-
+      "Kyverno webhook configuration '" + request.name + "' is protected: " +
+      request.userInfo.username + " may not " + request.operation + " it. " +
+      "Changing or removing it silently disables all Kyverno policy enforcement."
+
+---
+# =============================================================================
+# The binding is the on/off switch. Roll out with validationActions [Audit, Warn]
+# first and watch the audit log before switching to [Deny]:
+#   kubectl get --raw /api/v1/... | grep protect-kyverno-webhooks
+# =============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: protect-kyverno-webhooks-binding
+spec:
+  policyName: protect-kyverno-webhooks
+  validationActions: ["Deny"]
+  # No matchResources: applies to everything matchConstraints selects.
+  # These resources are cluster-scoped, so namespaceSelector would be meaningless.

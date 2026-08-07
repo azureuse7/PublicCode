@@ -1,0 +1,77 @@
+# =============================================================================
+# OPTIONAL - beyond what was asked for, but without it the two policies above
+# are removable by anyone who can delete a VAP binding, which is most of their
+# threat model.
+#
+# Unlike a webhook, a VAP genuinely can protect itself: the DELETE request is
+# evaluated in-process by kube-apiserver, so this policy is enforced against
+# attempts to remove it.
+#
+# ### READ THIS BEFORE APPLYING ###
+#
+# That self-enforcement is also a real lockout risk. If the break-glass group
+# below is wrong, NOBODY can remove this policy through the API. Recovery means
+# disabling the ValidatingAdmissionPolicy feature at the API server or editing
+# etcd directly - neither of which you can do on EKS, AKS or GKE.
+#
+#   1. Verify the group resolves to a real identity you hold, BEFORE applying:
+#        kubectl auth whoami
+#   2. Apply it in a scratch cluster and prove you can delete it again.
+#   3. Only then apply it anywhere that matters.
+#
+# Note the layering this creates: VAP 02's break-glass is "delete the binding",
+# and this policy makes that itself require the break-glass group. That is the
+# intent - it means granting a Kyverno exception now requires a named, audited,
+# privileged identity - but it is a second gate, so be deliberate about it.
+# =============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: protect-kyverno-guard-policies
+spec:
+  failurePolicy: Fail
+
+  matchConstraints:
+    resourceRules:
+    # UPDATE and DELETE only. CREATE is deliberately absent so new admission
+    # policies can always be added - this guards the two above, it is not a
+    # general lock on admission control.
+    - apiGroups:   ["admissionregistration.k8s.io"]
+      apiVersions: ["*"]
+      operations:  ["UPDATE", "DELETE"]
+      resources:
+      - validatingadmissionpolicies
+      - validatingadmissionpolicybindings
+      resourceNames:
+      - protect-kyverno-webhooks
+      - protect-kyverno-webhooks-binding
+      - protect-kyverno-policy-exceptions
+      - protect-kyverno-policy-exceptions-binding
+      - protect-kyverno-guard-policies
+      - protect-kyverno-guard-policies-binding
+
+  matchConditions:
+  # >>> REPLACE THIS <<< with a group you can actually authenticate as.
+  # Confirm with: kubectl auth whoami
+  - name: exclude-break-glass
+    expression: "!('cluster-break-glass' in request.userInfo.groups)"
+
+  validations:
+  - expression: "false"
+    reason: Forbidden
+    message: >-
+      This admission policy guards Kyverno enforcement and can only be changed
+      by the cluster-break-glass group.
+    messageExpression: >-
+      "'" + request.name + "' guards Kyverno policy enforcement. " +
+      request.userInfo.username + " may not " + request.operation + " it - " +
+      "membership of the cluster-break-glass group is required."
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: protect-kyverno-guard-policies-binding
+spec:
+  policyName: protect-kyverno-guard-policies
+  validationActions: ["Deny"]

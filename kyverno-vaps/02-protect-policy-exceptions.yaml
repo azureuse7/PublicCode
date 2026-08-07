@@ -1,0 +1,80 @@
+# =============================================================================
+# Locks Kyverno PolicyExceptions.
+#
+# PolicyExceptions are the sanctioned bypass - the cheapest way to defeat a
+# policy is not to attack it but to write an exception exempting your workload.
+#
+# This is deliberately built with NO exemption path, per the design discussed:
+# to add or change an exception you must first disable the binding below. That
+# makes granting an exemption a two-step, privileged, audited act rather than a
+# quiet `kubectl apply` nobody notices. Under GitOps it becomes a reviewed PR.
+#
+# If you would rather have a named group that can edit exceptions in place,
+# see the commented matchCondition at the bottom of the policy.
+# =============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: protect-kyverno-policy-exceptions
+spec:
+  failurePolicy: Fail
+
+  matchConstraints:
+    resourceRules:
+    # Kyverno 1.14+ serves PolicyException from both groups depending on whether
+    # it pairs with the legacy ClusterPolicy or the newer ValidatingPolicy
+    # (vpol) types. Covering both avoids a gap during migration. Trim to
+    # whichever your cluster actually serves:
+    #   kubectl api-resources | grep policyexception
+    - apiGroups:   ["kyverno.io", "policies.kyverno.io"]
+      apiVersions: ["*"]
+      operations:  ["CREATE", "UPDATE", "DELETE"]
+      resources:   ["policyexceptions"]
+
+  # Intentionally no matchConditions. Every principal is in scope, including
+  # cluster-admins and the Kyverno service accounts - Kyverno does not create
+  # PolicyExceptions itself, so nothing operational needs an exemption.
+  #
+  # To allow a named break-glass group to bypass instead, uncomment:
+  #
+  # matchConditions:
+  # - name: exclude-exception-admins
+  #   expression: "!('kyverno-exception-admins' in request.userInfo.groups)"
+
+  validations:
+  - expression: "false"
+    reason: Forbidden
+    message: >-
+      PolicyExceptions are locked by the protect-kyverno-policy-exceptions
+      ValidatingAdmissionPolicy.
+    messageExpression: >-
+      "PolicyException '" + request.namespace + "/" + request.name +
+      "' is locked: " + request.userInfo.username + " may not " +
+      request.operation + " it. Exceptions can only be changed by first " +
+      "removing the protect-kyverno-policy-exceptions-binding " +
+      "ValidatingAdmissionPolicyBinding, which is itself an audited change."
+
+---
+# =============================================================================
+# THIS BINDING IS THE BREAK-GLASS LEVER.
+#
+# To legitimately add or amend an exception:
+#   1. delete this binding            (PR / audited change)
+#   2. apply the PolicyException
+#   3. re-apply this binding          (PR / audited change)
+#
+# Deleting the binding rather than the policy keeps the policy definition in
+# place, so step 3 is a one-line revert.
+# =============================================================================
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: protect-kyverno-policy-exceptions-binding
+spec:
+  policyName: protect-kyverno-policy-exceptions
+  validationActions: ["Deny"]
+  # Cluster-wide. To lock exceptions only in production namespaces, scope with:
+  # matchResources:
+  #   namespaceSelector:
+  #     matchLabels:
+  #       environment: production
