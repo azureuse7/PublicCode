@@ -53,7 +53,55 @@ kcsv() {
 Call it with the pod name and namespace — that's the only part you fill in:
 
 ```bash
-kcsv <pod-name> <namespace>
+---
+kind: Pod
+apiVersion: v1
+metadata:
+  name: sample-app-vault-read
+  labels:
+    app: sample
+    vault-sidecar-injector: enabled
+  annotations:
+    vault.hashicorp.com/agent-inject: "true"
+    vault.hashicorp.com/agent-inject-secret-test: "secrets/CLUSTER_NAME-bdd-test"
+    vault.hashicorp.com/namespace: "KMAAS_NAMESPACE"
+    vault.hashicorp.com/auth-path: "auth/VAULT_AUTH_PATH"
+    vault.hashicorp.com/role: "CLUSTER_NAME-bdd-role"
+    vault.hashicorp.com/agent-inject-token: "true"
+    vault.hashicorp.com/agent-service-account-token-volume-name: "vault-token"
+    vault.hashicorp.com/tls-skip-verify: "true"
+    vault.hashicorp.com/log-level: "debug"
+spec:
+  serviceAccountName: bdd-serviceaccount
+  automountServiceAccountToken: false
+  volumes:
+    - name: vault-token
+      projected:
+        sources:
+          - serviceAccountToken:
+              path: token
+              expirationSeconds: 600
+  containers:
+    - name: sample-app-vault-read
+      image: REGISTRY_DOCKER/nginx:1.27.3
+      imagePullPolicy: IMAGE_PULL_POLICY
+      command: ["/bin/bash"]
+      args: ["-c", "cat /vault/secrets/test; sleep 3000"]
+      resources:
+        requests:
+          memory: "100Mi"
+          cpu: "100m"
+        limits:
+          memory: "100Mi"
+          cpu: "100m"
+  imagePullSecrets:
+    - name: artifactory-sync
+  nodeSelector:
+    kubernetes.io/os: linux
+  tolerations:
+    - key: "CriticalAddonsOnly"
+      operator: "Exists"
+      effect: "NoSchedule"
 ```
 
 Example:
