@@ -1,0 +1,13 @@
+@then(u'I should see an error with status of "{status}" and message containing "{reason_primary}" or "{reason_secondary}" with error code "{error_code_primary}" or "{error_code_secondary}"')
+def check_error_response_code(context, status, reason_primary, reason_secondary, error_code_primary, error_code_secondary):
+    """Step."""
+    if isinstance(context.resource_response, FailToCreateError):
+        error_json = json.loads(context.resource_response.api_exceptions[0].body)
+        if reason_primary not in error_json["message"]:
+            if reason_secondary not in error_json["message"]:
+                assert False
+        assert error_json["code"] in (int(error_code_primary), int(error_code_secondary)), \
+            f"Expected error code {error_code_primary} or {error_code_secondary}, got {error_json['code']}"
+        assert error_json["status"] == status
+    else:
+        raise AssertionError("Pod was allowed to be created")
