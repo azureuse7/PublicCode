@@ -5,7 +5,8 @@
 **Transcription:** read from the page images. The Qur'anic verses are given as printed; small diacritic slips in my transcription are possible, so check against the PDF for any citation.
 **Translation:** my own English translation. It tries to stay close to the Urdu rather than smooth it out.
 
-> **Verse numbers:** this edition counts *Bismillah* as verse 1, so its numbers are one higher than most English Qur'ans. Al-Jumu'ah 4 = 62:3, Al-A'raf 159 = 7:158, Al-Ma'idah 4 = 5:3, Al-Bayyinah 3–4 = 98:2–3, As-Saff 10 = 61:9.
+> **Verse numbers:** this edition counts *Bismillah* as verse 1, so its numbers are one higher than most English Qur'ans. Al-Jumu'ah 4 = 62:3, Al-A'raf 159 = 7:158, Al-Ma'idah 4 = 5:3, Al-Bayyinah 3–4 = 98:2–3, As-Saff 10 = 61:python -m pip install -r requirements.txt && python -m pip check
+
 
 ---
 
