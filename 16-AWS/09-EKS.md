@@ -7,6 +7,22 @@
 ## Architecture Overview
 
 ```
+
+# Tag 1 pod on every node as "delete first"
+MARKED=0
+for n in $(kubectl -n heman3 get pods -o wide --no-headers | awk '{print $7}' | sort -u); do
+  p=$(kubectl -n heman3 get pods --field-selector spec.nodeName=$n -o name | head -1)
+  kubectl -n heman3 annotate $p controller.kubernetes.io/pod-deletion-cost=-1000 --overwrite
+  MARKED=$((MARKED+1))
+done
+echo "marked $MARKED pods"   # should be 7
+
+# Note the start time, then scale down
+date
+kubectl -n heman3 scale deploy falco-bdd-test --replicas=$((42-MARKED))
+
+# Check: every node should show 5
+kubectl -n heman3 get pods -o wide --no-headers | awk '{print $7}' | sort | uniq -c
 ┌─────────────────────────────────────────────┐
 │           AWS Managed Control Plane          │
 │  (API server, etcd, scheduler, controllers)  │
