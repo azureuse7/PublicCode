@@ -222,6 +222,22 @@ aws iam enable-mfa-device \
 
 ## 2. Baseline measurement (before LocalDNS)
 
+kubectl run dnsbase --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 --restart=Never -- sleep 3600
+
+kubectl exec -it dnsbase -- cat /etc/resolv.conf
+
+# Note which node the pod is on, for a fair comparison later
+kubectl get pod dnsbase -o wide
+
+# In-cluster lookup – prints average and max
+kubectl exec dnsbase -- sh -c 'for i in $(seq 1 50); do dig +noall +stats kubernetes.default.svc.cluster.local | grep "Query time"; done' \
+  | awk '{s+=$4; if($4>m)m=$4} END {print "avg", s/NR, "ms, max", m, "ms"}'
+
+# External lookup – prints average and max
+kubectl exec dnsbase -- sh -c 'for i in $(seq 1 50); do dig +noall +stats microsoft.com | grep "Query time"; done' \
+  | awk '{s+=$4; if($4>m)m=$4} END {print "avg", s/NR, "ms, max", m, "ms"}'
+
+
 ```bash
 kubectl run dnsbase --image=registry.k8s.io/e2e-test-images/jessie-dnsutils:1.3 --restart=Never -- sleep 3600
 
